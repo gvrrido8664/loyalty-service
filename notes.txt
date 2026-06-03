@@ -1,0 +1,143 @@
+# Cuaderno de notas — Servicio de Clientes
+
+---
+
+## Inicio del proyecto
+
+Abro el CSV que me pasaron. 271 filas. Lo primero que salta: hay emails inválidos (con guiones bajos), nombres en MAYÚSCULAS, teléfonos tipo "sin telefono", y un montón de DNIs vacíos. También hay clientes duplicados — misma persona aparece 3 veces con leves variaciones. OK, el CSV viene sucio. Voy a necesitar limpiar antes de meter a la BD.
+
+## ¿SQLite o Postgres?
+
+Dudo un segundo. Postgres sería más "producción", pero para esta prueba levantar Docker es innecesario. Voy con SQLite — archivo, portable, cero configuración. Si esto fuera a producción real obviamente iría con Postgres, pero para demostrar la API con 271 registros sobra. Además el requerimiento no especifica motor.
+
+## Modelo de datos
+
+Me pongo con el schema de Prisma. Decisiones:
+- ID con UUID en vez de autoincremental. Es un sistema de fidelización, no quiero exponer IDs secuenciales que permitan deducir cuántos clientes tengo.
+- El email lo pongo @unique. Es el identificador natural para evitar duplicados reales.
+- DNI lo dejo opcional (String?). Dudé un segundo porque en Argentina el DNI es casi universal, pero en el CSV hay muchos sin DNI. Si lo hago obligatorio pierdo clientes reales. En fidelización prefiero tener al cliente registrado sin DNI que no tenerlo.
+
+## Carga del CSV — el script de seed
+
+Podría haber hecho un endpoint de upload, pero me parecía overkill. Además un seed es lo estándar para "data inicial" en cualquier proyecto serio. Hago prisma/seed.ts.
+
+Lo que hace el script:
+- Abre el CSV con csv-parser
+- Por cada fila limpia: nombres a Title Case, teléfonos sin espacios, emails inválidos a null
+- Si el cliente tiene email válido → upsert (si ya existe, actualiza; si no, crea). Esto resuelve los duplicados del CSV.
+- Si no tiene email → create simple. No puedo hacer upsert sin email porque es el unique.
+
+El upsert fue clave. Sin eso, la segunda vez que aparece "MARIA GOMEZ" crashea por duplicado.
+
+Probé el seed y funcionó sin problemas.
+
+## API en NestJS
+
+Genero el módulo customers con nest generate. Arquitectura simple: Controller → Service → Prisma.
+
+Dos endpoints bajo /customers:
+- POST: crea un cliente nuevo
+- GET: busca clientes
+
+### El buscador
+
+Dudé si hacer endpoints separados (GET /customers/:id, GET /customers?name=X, GET /customers?dni=X). Lo descarté. Pensé en quién va a usar esto: un cajero o vendedor con una barra de búsqueda. No va a andar eligiendo "buscar por nombre" vs "buscar por DNI" — quiere meter cualquier cosa y que encuentre. Así que hago un solo GET con query param "search" que hace LIKE sobre nombre, email y DNI. Es más práctico.
+
+Si no mandan search, devuelvo los últimos 50 clientes ordenados por fecha. No voy a devolver todos porque si esto escala a millones es un problema.
+
+### Validación
+
+Quería validar el body del POST. Instalé class-validator y class-transformer. Armé un CreateCustomerDto:
+- name: obligatorio, string, no vacío
+- email: opcional, si viene tiene que ser formato email
+- phone y dni: opcionales, strings
+
+Puse un ValidationPipe global en main.ts con whitelist: true. Cualquier campo extra que manden se ignora.
+
+En el service, antes de crear chequeo si el email ya existe. Si existe → 409 Conflict. No quiero respuestas genéricas 500, quiero que el frontend sepa exactamente qué pasó.
+
+## Los problemas con Prisma 7
+
+Acá me trabé. Ejecuto el seed y me tira:
+```
+Module '@prisma/client' has no exported member 'PrismaClient'
+```
+
+Ok, no generé el cliente. npx prisma generate. Listo.
+
+Segundo error:
+```
+'datasourceUrl' does not exist in type 'PrismaClientOptions'
+```
+
+¿Qué? Investigué y resulta que Prisma v7 (estoy en la 7.8.0) eliminó datasourceUrl del constructor. Ahora es OBLIGATORIO usar un driver adapter. Para SQLite necesitas @prisma/adapter-libsql + @libsql/client.
+
+Esto no me lo esperaba. Instalé los paquetes y cambié:
+```ts
+// Antes (Prisma 6)
+new PrismaClient({ datasourceUrl: 'file:./dev.db' })
+
+// Ahora (Prisma 7)
+new PrismaClient({ adapter: new PrismaLibSql({ url: 'file:./dev.db' }) })
+```
+
+Tuve que tocar el seed.ts Y el PrismaService. Encima la clase se llama PrismaLibSql (con Sql en PascalCase, no SQL). Perdí unos minutos con eso.
+
+### Tsconfig también dio guerra
+
+ignoreDeprecations con valor "6.0" tiraba TS5103. Probé "5.0" y anduvo. También baseUrl estaba deprecado, así que lo quité. moduleResolution lo dejé en nodenext que es lo actual.
+
+### Problema con los imports
+
+Otro error: Cannot find module '../prisma.service'. Con nodenext los imports relativos necesitan la extensión .js. Cambié a '../prisma.service.js' y listo. Esto siempre me hace perder 5 minutos.
+
+### DTO y strictNullChecks
+
+El name en el DTO tiraba error de que no está inicializado. Le puse el bang (!) porque class-validator lo resuelve en runtime. Sé que no es la solución más elegante, pero para un DTO funciona.
+
+---
+
+## Lo que decidí NO hacer (y por qué)
+
+- **Autenticación**: no la pedían, no la hice. En un sistema real iría JWT o API key como mínimo.
+
+- **Paginación**: el `take: 50` sin filtro es un mini control para que no explote, pero no es paginación real con offset/cursor. Para 271 registros no se justifica. Si esto creciera a producción, lo primero que agregaría es `skip`/`take` con metadatos de `total` en la respuesta.
+
+- **Rate limiting**: no lo pedían y 271 clientes no justifican preocuparse por abusos de API. En producción usaría `@nestjs/throttler`.
+
+- **Frontend / UI**: no lo pedían. Solo API.
+
+- **Validación perfecta del CSV**: el seed limpia lo obvio (mayúsculas, emails basura, espacios en teléfonos) pero no cubre todos los edge cases. Por ejemplo, no valido que un DNI tenga formato numérico ni que un teléfono tenga longitud mínima. Para una carga inicial de 271 registros me pareció suficiente con lo que hice. Si el volumen fuera mayor, separaría la lógica de limpieza en un pipeline más robusto con logs de registros rechazados.
+
+- **Manejo de borrado lógico (soft delete)**: no lo implementé. En fidelización normalmente no se borran clientes, se los marca como inactivos. Pero para esta prueba no se pidió y no quise agregar complejidad innecesaria.
+
+- **Tests automatizados**: el proyecto generó el esqueleto de Jest pero no escribí tests. En un proyecto real los haría, pero para una prueba técnica con este alcance preferí dedicar el tiempo a que la API funcione bien y las notas reflejen mi razonamiento.
+
+---
+
+## Herramientas que usé
+
+- **NestJS**: framework. Lo elegí porque es el que más uso y tiene una estructura opinada que me obliga a ser ordenado desde el minuto cero.
+- **Prisma 7**: ORM. Venía de usar la 5, la 7 me sorprendió con el cambio de adapters pero una vez que lo entiendes tiene sentido — desacopla el cliente del driver.
+- **SQLite + @prisma/adapter-libsql**: base de datos. Simple, portable, sin Docker.
+- **class-validator + class-transformer**: validación de DTOs. No quería validar a mano en el controller como un cavernícola.
+- **csv-parser**: para leer el CSV en el seed. Liviano, hace streaming, no me carga 271 filas en memoria de golpe aunque para este volumen daba igual.
+- **VS Code**: editor, con la extensión de Prisma para syntax highlighting del schema.
+- **Thunder Client** (extensión de VS Code): para probar los endpoints. Más rápido que curl o Postman cuando estás en el editor.
+- **ts-node**: para correr el seed sin compilar.
+
+## Uso de IA
+
+Usé GitHub Copilot como asistente durante toda la prueba. Así lo usé:
+
+- **Boilerplate**: para generar la estructura inicial de NestJS, el PrismaService, los decoradores. Me ahorró escribir código repetitivo.
+- **Debugging**: cuando me trabé con Prisma 7, la IA me ayudó a identificar rápido que datasourceUrl estaba deprecado y que necesitaba el adapter. Me tiró la documentación justa sin tener que buscar 20 pestañas.
+- **Sintaxis**: para acordarme de la sintaxis de @IsEmail, @IsOptional, el ValidationPipe, etc. Son cosas que uno sabe pero se olvida el import exacto.
+- **Tsconfig**: los errores de ignoreDeprecations y baseUrl los resolvió la IA sugiriendo los valores correctos para la versión de TS que tengo instalada.
+
+Lo que NO usé IA:
+- Las decisiones de arquitectura (SQLite vs Postgres, UUID vs autoincremental, DNI opcional, buscador único vs múltiples endpoints).
+- La lógica de limpieza del CSV. Eso salió de mirar los datos y pensar "si yo fuera el dueño del negocio, ¿qué datos quiero guardar y cuáles descarto?"
+- La validación de duplicados con 409 Conflict. Es un criterio REST que ya tenía incorporado.
+
+La IA fue un acelerador, no un piloto automático. Cada línea que generó la leí y entendí antes de aceptarla.
