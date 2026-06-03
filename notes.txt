@@ -141,3 +141,23 @@ Lo que NO usé IA:
 - La validación de duplicados con 409 Conflict. Es un criterio REST que ya tenía incorporado.
 
 La IA fue un acelerador, no un piloto automático. Cada línea que generó la leí y entendí antes de aceptarla.
+
+---
+
+## Fix: Jest types no reconocidos en tests
+
+Al abrir los archivos de test (`*.spec.ts`), TypeScript marcaba errores en `describe`, `it`, `beforeEach` y `expect`:
+
+```
+Cannot find name 'describe'. Do you need to install type definitions for a test runner?
+```
+
+`@types/jest` ya estaba instalado (v30). El problema era que al usar `"moduleResolution": "nodenext"` en tsconfig, TypeScript no escanea automáticamente todos los `@types/*` como lo haría con `"node"`. Necesita que le digas explícitamente qué tipos globales cargar.
+
+**Solución:** Agregué `"types": ["jest", "node"]` al `compilerOptions` de `tsconfig.json`.
+
+```json
+"types": ["jest", "node"]
+```
+
+Con esto TypeScript ya reconoce los globales de Jest en todos los archivos `.spec.ts` sin necesidad de imports explícitos. Para aplicar el cambio hay que reiniciar el TS Server (`Ctrl+Shift+P` → `TypeScript: Restart TS Server`).
