@@ -1,5 +1,1 @@
-export default {
-  datasource: {
-    url: "file:./dev.db",
-  },
-};
+export default { datasource: { url: process.env.DATABASE_URL || "file:./dev.db" } };

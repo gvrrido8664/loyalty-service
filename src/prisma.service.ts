@@ -6,7 +6,7 @@ import { PrismaLibSql } from '@prisma/adapter-libsql';
 export class PrismaService extends PrismaClient implements OnModuleInit {
   constructor() {
     super({
-      adapter: new PrismaLibSql({ url: 'file:./dev.db' }),
+      adapter: new PrismaLibSql({ url: process.env.DATABASE_URL || 'file:./dev.db' }),
     });
   }
 

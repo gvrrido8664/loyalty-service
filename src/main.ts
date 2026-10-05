@@ -11,6 +11,6 @@ async function bootstrap() {
     whitelist: true, // Ignora datos extra que no estén definidos en el DTO
   }));
 
-  await app.listen(3000);
+  await app.listen(Number(process.env.PORT || 3000), '127.0.0.1');
 }
 bootstrap();
